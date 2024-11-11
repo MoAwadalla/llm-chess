@@ -7,6 +7,7 @@ from typing import Optional, Tuple, Dict, Any, List
 from pathlib import Path
 import math
 import openai
+import anthropic
 from dataclasses import dataclass
 
 @dataclass
@@ -17,8 +18,8 @@ class ChessConfig:
     output_path: str = "game.pgn"
 
 @dataclass
-class LLMConfig:
-    """Configuration for LLM-based chess models"""
+class LMConfig:
+    """Configuration for LM-based chess models"""
     model_name: str
     api_key: str
     max_retries: int = 3
@@ -61,14 +62,14 @@ class GPT4ChessModel(ChessModel):
     GPT-4 implementation of a chess model.
     Uses structured prompting to get valid moves.
     """
-    def __init__(self, config: LLMConfig):
+    def __init__(self, config: LMConfig):
         self.config = config
         openai.api_key = config.api_key
         self._role = "White" if config.is_white else "Black"
 
     @property
     def name(self) -> str:
-        return f"GPT4-{self.config.model_name}"
+        return f"{self.config.model_name}"
 
     def create_prompt(self, board: chess.Board) -> str:
         """Create a structured prompt for the current board state"""
@@ -93,70 +94,91 @@ Important:
         """Get the next move from GPT-4"""
         prompt = self.create_prompt(board)
 
-        for attempt in range(self.config.max_retries):
+        for _ in range(self.config.max_retries):
+            response = openai.chat.completions.create(
+                model=self.config.model_name,
+                messages=[
+                    {"role": "system", "content": "You are a chess engine. Respond only with moves in algebraic notation."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=10
+            )
+
+            move_str = response.choices[0].message.content.strip()
             try:
-                response = openai.chat.completions.create(
-                    model=self.config.model_name,
-                    messages=[
-                        {"role": "system", "content": "You are a chess engine. Respond only with moves in algebraic notation."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    max_tokens=10
-                )
-
-                move_str = response.choices[0].message.content.strip()
                 move = board.parse_san(move_str)
-
-                if move in board.legal_moves:
-                    return move
-
             except Exception as e:
-                if attempt == self.config.max_retries - 1:
-                    # If all retries failed, make a fallback move
-                    return self._get_fallback_move(board)
+                print(f"Error parsing move: {e}")
                 continue
 
-        return self._get_fallback_move(board)
+            if move in board.legal_moves:
+                return move
 
-    def _get_fallback_move(self, board: chess.Board) -> chess.Move:
-        """Make a simple fallback move if GPT-4 fails"""
-        # Prioritize captures, then checks, then any legal move
-        legal_moves = list(board.legal_moves)
 
-        # Try captures first
-        captures = [move for move in legal_moves if board.is_capture(move)]
-        if captures:
-            return captures[0]
+class ClaudeChessModel(ChessModel):
+    """
+    Claude implementation of a chess model.
+    Uses structured prompting to get valid moves.
+    """
+    def __init__(self, config: LMConfig):
+        self.config = config
+        self._role = "White" if config.is_white else "Black"
+        self.client = anthropic.Anthropic(api_key=config.api_key)
 
-        # Then checks
-        checks = [move for move in legal_moves if board.gives_check(move)]
-        if checks:
-            return checks[0]
+    @property
+    def name(self) -> str:
+        return f"{self.config.model_name}"
 
-        # Finally, any legal move
-        return legal_moves[0]
+    def create_prompt(self, board: chess.Board) -> str:
+        """Create a structured prompt for the current board state"""
+        legal_moves = [board.san(move) for move in board.legal_moves]
 
-    def _get_material_count(self, board: chess.Board) -> Dict[str, int]:
-        """Calculate material count for both sides"""
-        piece_values = {
-            chess.PAWN: 1,
-            chess.KNIGHT: 3,
-            chess.BISHOP: 3,
-            chess.ROOK: 5,
-            chess.QUEEN: 9
-        }
+        return f"""As a chess engine playing {self._role}, analyze this position:
 
-        white_material = sum(
-            len(board.pieces(piece_type, chess.WHITE)) * value
-            for piece_type, value in piece_values.items()
-        )
+Current Board State:
+{board}
 
-        black_material = sum(
-            len(board.pieces(piece_type, chess.BLACK)) * value
-            for piece_type, value in piece_values.items()
-        )
+PGN: {str(board)}
 
-        return {"White": white_material, "Black": black_material}
+Legal moves: {', '.join(legal_moves)}
+
+Important:
+1. Consider piece activity, king safety, and pawn structure
+2. Choose the best move from the legal moves list
+3. Respond ONLY with the chosen move in standard algebraic notation (e.g., "e4" or "Nf3")
+4. No explanations or additional text"""
+
+    def get_move(self, board: chess.Board) -> chess.Move:
+        """Get the next move from Claude"""
+        prompt = self.create_prompt(board)
+
+        for _ in range(self.config.max_retries):
+            message = self.client.messages.create(
+                model=self.config.model_name,
+                max_tokens=10,
+                system="You are a chess engine. Respond only with moves in algebraic notation.",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt
+                            }
+                        ]
+                    }
+                ]
+            )
+
+            move_str = message.content[0].text.strip()
+            try:
+                move = board.parse_san(move_str)
+            except Exception as e:
+                print(f"Error parsing move: {e}")
+                continue
+
+            if move in board.legal_moves:
+                return move
 
 class ChessGame:
     """Manages a chess game between two models"""
@@ -181,6 +203,9 @@ class ChessGame:
                 print(self.board)
 
             move = current_player.get_move(self.board)
+            if not move:
+                print(f"Invalid move from {current_player.name}")
+                break
             if verbose:
                 print(f"Move: {self.board.san(move)}")
 
@@ -266,19 +291,20 @@ class ChessGame:
             print(f"Good moves: {stats['good_moves']}")
             print(f"Blunders: {stats['blunders']}")
 
-def play_chess_game(config: ChessConfig, llm_config: LLMConfig) -> None:
+def play_chess_game(config: ChessConfig, lm_config: LMConfig) -> None:
     """Utility function to quickly set up and play a game"""
     # Create models
-    gpt_model = GPT4ChessModel(llm_config)
+    #lm_model = GPT4ChessModel(lm_config)
+    lm_model = ClaudeChessModel(lm_config)
     stockfish = StockfishModel(config.stockfish_path)
 
     # Set up players based on color
-    if llm_config.is_white:
-        white_player = gpt_model
+    if lm_config.is_white:
+        white_player = lm_model
         black_player = stockfish
     else:
         white_player = stockfish
-        black_player = gpt_model
+        black_player = lm_model
 
     # Create evaluator for analysis
     evaluator = StockfishModel(config.stockfish_path)
@@ -305,10 +331,19 @@ if __name__ == "__main__":
         output_path="game.pgn"
     )
 
-    llm_config = LLMConfig(
-        model_name="gpt-4o-mini",
-        api_key=os.getenv("OPENAI_API_KEY"),
-        is_white=True  # GPT-4 plays as White
+
+
+    # lm_config = LMConfig(
+    #     model_name="gpt-4o-mini",
+    #     api_key=os.getenv("OPENAI_API_KEY"),
+    #     is_white=True
+    # )
+
+    lm_config = LMConfig(
+        model_name="claude-3-5-sonnet-20241022",
+        api_key=os.getenv("ANTHROPIC_API_KEY"),
+        is_white=True,
+        max_retries=3
     )
 
-    play_chess_game(chess_config, llm_config)
+    play_chess_game(chess_config, lm_config)
