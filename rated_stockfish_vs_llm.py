@@ -22,6 +22,7 @@ class LMConfig:
     """Configuration for LM-based chess models"""
     model_name: str
     api_key: str
+    type: str
     max_retries: int = 3
     is_white: bool = True
 
@@ -102,6 +103,62 @@ Important:
                     {"role": "user", "content": prompt}
                 ],
                 max_tokens=10
+            )
+
+            move_str = response.choices[0].message.content.strip()
+            try:
+                move = board.parse_san(move_str)
+            except Exception as e:
+                print(f"Error parsing move: {e}")
+                continue
+
+            if move in board.legal_moves:
+                return move
+
+
+class O1ChessModel(ChessModel):
+    """
+    O1 implementation of a chess model.
+    Uses structured prompting to get valid moves.
+    """
+    def __init__(self, config: LMConfig):
+        self.config = config
+        openai.api_key = config.api_key
+        self._role = "White" if config.is_white else "Black"
+
+    @property
+    def name(self) -> str:
+        return f"{self.config.model_name}"
+
+    def create_prompt(self, board: chess.Board) -> str:
+        """Create a structured prompt for the current board state"""
+        legal_moves = [board.san(move) for move in board.legal_moves]
+
+        return f"""As a chess engine playing {self._role}, analyze this position:
+
+Current Board State:
+{board}
+
+PGN: {str(board)}
+
+Legal moves: {', '.join(legal_moves)}
+
+Important:
+1. Consider piece activity, king safety, and pawn structure
+2. Choose the best move from the legal moves list
+3. Respond ONLY with the chosen move in standard algebraic notation (e.g., "e4" or "Nf3")
+4. No explanations or additional text"""
+
+    def get_move(self, board: chess.Board) -> chess.Move:
+        """Get the next move from GPT-4"""
+        prompt = self.create_prompt(board)
+
+        for _ in range(self.config.max_retries):
+            response = openai.chat.completions.create(
+                model=self.config.model_name,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ]
             )
 
             move_str = response.choices[0].message.content.strip()
@@ -205,7 +262,7 @@ class ChessGame:
             move = current_player.get_move(self.board)
             if not move:
                 print(f"Invalid move from {current_player.name}")
-                break
+                return None, None
             if verbose:
                 print(f"Move: {self.board.san(move)}")
 
@@ -294,8 +351,15 @@ class ChessGame:
 def play_chess_game(config: ChessConfig, lm_config: LMConfig) -> None:
     """Utility function to quickly set up and play a game"""
     # Create models
-    #lm_model = GPT4ChessModel(lm_config)
-    lm_model = ClaudeChessModel(lm_config)
+    lm_model = None
+    if "openai" in lm_config.type:
+        if "o1" in lm_config.model_name:
+            lm_model = O1ChessModel(lm_config)
+        elif "gpt" in lm_config.model_name:
+            lm_model = GPT4ChessModel(lm_config)
+    elif "anthropic" in lm_config.type:
+        lm_model = ClaudeChessModel(lm_config)
+    assert lm_model
     stockfish = StockfishModel(config.stockfish_path)
 
     # Set up players based on color
@@ -317,10 +381,13 @@ def play_chess_game(config: ChessConfig, lm_config: LMConfig) -> None:
     )
 
     pgn, stats = game.play_game(verbose=config.verbose)
+    if not pgn or not stats:
+        return None
 
     # Save game
-    with open(config.output_path, "w") as f:
+    with open(config.output_path, "x") as f:
         f.write(pgn)
+    return stats
 
 if __name__ == "__main__":
     import os
