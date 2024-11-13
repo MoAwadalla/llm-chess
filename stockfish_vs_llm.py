@@ -291,22 +291,23 @@ class ChessGame:
             if is_white_turn != self.llm_is_white:
                 continue
 
-            prev_score = stats[i-1]
+            prev_score = stats[i - 1]
             curr_score = stats[i]
 
-            # Convert mate scores to centipawn values
+            # Convert scores to centipawns, ignoring checkmate values
             def score_to_cp(score):
                 if score.relative.is_mate():
-                    if score.relative.mate() > 0:
-                        return 20000 - (score.relative.mate() * 10)
-                    else:
-                        return -20000 - (score.relative.mate() * 10)
+                    return None  # Ignore mate scores in centipawn loss calculations
                 return score.relative.score()
 
             prev_cp = score_to_cp(prev_score)
             curr_cp = score_to_cp(curr_score)
 
-            # Calculate loss from LLM's perspective
+            # Only continue if both previous and current scores are centipawn values
+            if prev_cp is None or curr_cp is None:
+                continue
+
+            # Calculate centipawn loss from LLM's perspective
             if self.llm_is_white:
                 loss = -(curr_cp - prev_cp)
             else:
@@ -329,7 +330,6 @@ class ChessGame:
             'llm_move_count': len(llm_losses),
             'detailed_losses': llm_losses
         }
-
 
 
     def create_pgn(self):
