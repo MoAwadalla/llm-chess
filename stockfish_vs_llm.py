@@ -1,170 +1,331 @@
 import chess
 import chess.pgn
-import openai
-import time
+import chess.engine
 from datetime import datetime
+from abc import ABC, abstractmethod
+from typing import Optional, Tuple, Dict, Any
+import openai
+import anthropic
+from dataclasses import dataclass
 
-def create_board_state_prompt(board, is_white):
-    """Create a concise but effective prompt for GPT about the current board state"""
-    color = "White" if is_white else "Black"
+@dataclass
+class ChessConfig:
+    """Configuration for chess games"""
+    stockfish_path: str = "/opt/homebrew/bin/stockfish"
+    verbose: bool = True
+    output_path: str = "game.pgn"
 
-    # Get simplified game state
-    in_check = board.is_check()
+@dataclass
+class LMConfig:
+    """Configuration for LM-based chess models"""
+    model_name: str
+    api_key: str
+    type: str
+    max_retries: int = 3
+    is_white: bool = True
 
-    prompt = f"""Chess position analysis - playing as {color}:
+class ChessModel(ABC):
+    """Abstract base class for chess models"""
+    @abstractmethod
+    def get_move(self, board: chess.Board) -> chess.Move:
+        """Get the next move from the model given a board state"""
+        pass
 
-Board PGN: {create_pgn(board, get_game_result(board))}
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Get the model name"""
+        pass
 
-Only Legal moves: {', '.join(board.san(move) for move in board.legal_moves)}
+class StockfishModel(ChessModel):
+    """Example implementation of a chess engine model"""
+    def __init__(self, path: str, time_limit: float = 0.01):
+        self.path = path
+        self.time_limit = time_limit
+        self.engine = chess.engine.SimpleEngine.popen_uci(path)
 
-Instructions:
-- Analyze position and select best legal move
-- Return ONLY the move in algebraic notation (e.g., "e4" or "Nf3")
-- No explanations or additional text"""
+    def get_move(self, board: chess.Board) -> chess.Move:
+        result = self.engine.play(board, chess.engine.Limit(time=self.time_limit))
+        return result.move
 
-    return prompt
+    @property
+    def name(self) -> str:
+        return "Stockfish"
 
-def get_last_move(board):
-    """Get the last move played"""
-    if not board.move_stack:
-        return "None"
-    last_move = board.move_stack[-1]
-    game_copy = chess.Board()
-    for move in board.move_stack[:-1]:
-        game_copy.push(move)
-    return f"{game_copy.san(last_move)}"
+    def __del__(self):
+        if hasattr(self, 'engine'):
+            self.engine.quit()
 
-def get_gpt_move(prompt, retries=3, delay=1):
-    """Get a move from GPT with retry logic"""
-    for attempt in range(retries):
-        try:
+class GPT4ChessModel(ChessModel):
+    """
+    GPT-4 implementation of a chess model.
+    Uses structured prompting to get valid moves.
+    """
+    def __init__(self, config: LMConfig):
+        self.config = config
+        openai.api_key = config.api_key
+        self._role = "White" if config.is_white else "Black"
+
+    @property
+    def name(self) -> str:
+        return f"{self.config.model_name}"
+
+    def create_prompt(self, board: chess.Board) -> str:
+        """Create a structured prompt for the current board state"""
+        legal_moves = [board.san(move) for move in board.legal_moves]
+
+        return f"""As a chess engine playing {self._role}, analyze this position:
+
+Current Board State:
+{board}
+
+PGN: {str(board)}
+
+Legal moves: {', '.join(legal_moves)}
+
+Important:
+1. Consider piece activity, king safety, and pawn structure
+2. Choose the best move from the legal moves list
+3. Respond ONLY with the chosen move in standard algebraic notation (e.g., "e4" or "Nf3")
+4. No explanations or additional text"""
+
+    def get_move(self, board: chess.Board) -> chess.Move:
+        """Get the next move from GPT-4"""
+        prompt = self.create_prompt(board)
+
+        for _ in range(self.config.max_retries):
             response = openai.chat.completions.create(
-                model="gpt-4o-mini",
+                model=self.config.model_name,
                 messages=[
                     {"role": "system", "content": "You are a chess engine. Respond only with moves in algebraic notation."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.2,
-                max_tokens=5
+                max_tokens=10
             )
 
             move_str = response.choices[0].message.content.strip()
-            return move_str
+            try:
+                move = board.parse_san(move_str)
+            except Exception as e:
+                print(f"Error parsing move: {e}")
+                continue
 
-        except Exception as e:
-            if attempt < retries - 1:
-                print(f"Error getting move from GPT (attempt {attempt + 1}): {e}")
-                time.sleep(delay)
-            else:
-                raise Exception(f"Failed to get move from GPT after {retries} attempts: {e}")
+            if move in board.legal_moves:
+                return move
 
-def white_get_move(board):
-    """Get White's move from GPT"""
-    prompt = create_board_state_prompt(board, is_white=True)
-    move_str = get_gpt_move(prompt)
 
-    try:
-        move = board.parse_san(move_str)
-        if move in board.legal_moves:
-            return move
-        else:
-            raise ValueError(f"GPT suggested illegal move: {move_str}")
-    except ValueError as e:
-        raise Exception(f"Error processing GPT move: {e}")
+class O1ChessModel(ChessModel):
+    """
+    O1 implementation of a chess model.
+    Uses structured prompting to get valid moves.
+    """
+    def __init__(self, config: LMConfig):
+        self.config = config
+        openai.api_key = config.api_key
+        self._role = "White" if config.is_white else "Black"
 
-def black_get_move(board):
-    """Get Black's move from GPT"""
-    prompt = create_board_state_prompt(board, is_white=False)
-    move_str = get_gpt_move(prompt)
+    @property
+    def name(self) -> str:
+        return f"{self.config.model_name}"
 
-    try:
-        move = board.parse_san(move_str)
-        if move in board.legal_moves:
-            return move
-        else:
-            raise ValueError(f"GPT suggested illegal move: {move_str}")
-    except ValueError as e:
-        raise Exception(f"Error processing GPT move: {e}")
+    def create_prompt(self, board: chess.Board) -> str:
+        """Create a structured prompt for the current board state"""
+        legal_moves = [board.san(move) for move in board.legal_moves]
 
-def create_pgn(board, result):
-    """Create a PGN string from the game"""
-    game = chess.pgn.Game()
+        return f"""As a chess engine playing {self._role}, analyze this position:
 
-    # Set headers
-    game.headers["Event"] = "GPT vs GPT Chess Game"
-    game.headers["Site"] = "OpenAI GPT-4o mini"
-    game.headers["Date"] = datetime.now().strftime("%Y.%m.%d")
-    game.headers["Round"] = "1"
-    game.headers["White"] = "GPT-4o mini (White)"
-    game.headers["Black"] = "GPT-4o mini (Black)"
-    game.headers["Result"] = result
+Current Board State:
+{board}
 
-    # Reconstruct the game
-    node = game
-    for move in board.move_stack:
-        node = node.add_variation(move)
+PGN: {str(board)}
 
-    # Return PGN string
-    return str(game)
+Legal moves: {', '.join(legal_moves)}
 
-def get_game_result(board):
-    """Determine the game result in PGN format"""
-    if board.is_checkmate():
-        return "1-0" if board.turn == chess.BLACK else "0-1"
-    elif board.is_stalemate() or board.is_insufficient_material() or \
-         board.is_fifty_moves() or board.is_repetition():
-        return "1/2-1/2"
+Important:
+1. Consider piece activity, king safety, and pawn structure
+2. Choose the best move from the legal moves list
+3. Respond ONLY with the chosen move in standard algebraic notation (e.g., "e4" or "Nf3")
+4. No explanations or additional text"""
+
+    def get_move(self, board: chess.Board) -> chess.Move:
+        """Get the next move from GPT-4"""
+        prompt = self.create_prompt(board)
+
+        for _ in range(self.config.max_retries):
+            response = openai.chat.completions.create(
+                model=self.config.model_name,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ]
+            )
+
+            move_str = response.choices[0].message.content.strip()
+            try:
+                move = board.parse_san(move_str)
+            except Exception as e:
+                print(f"Error parsing move: {e}")
+                continue
+
+            if move in board.legal_moves:
+                return move
+
+
+class ClaudeChessModel(ChessModel):
+    """
+    Claude implementation of a chess model.
+    Uses structured prompting to get valid moves.
+    """
+    def __init__(self, config: LMConfig):
+        self.config = config
+        self._role = "White" if config.is_white else "Black"
+        self.client = anthropic.Anthropic(api_key=config.api_key)
+
+    @property
+    def name(self) -> str:
+        return f"{self.config.model_name}"
+
+    def create_prompt(self, board: chess.Board) -> str:
+        """Create a structured prompt for the current board state"""
+        legal_moves = [board.san(move) for move in board.legal_moves]
+
+        return f"""As a chess engine playing {self._role}, analyze this position:
+
+Current Board State:
+{board}
+
+PGN: {str(board)}
+
+Legal moves: {', '.join(legal_moves)}
+
+Important:
+1. Consider piece activity, king safety, and pawn structure
+2. Choose the best move from the legal moves list
+3. Respond ONLY with the chosen move in standard algebraic notation (e.g., "e4" or "Nf3")
+4. No explanations or additional text"""
+
+    def get_move(self, board: chess.Board) -> chess.Move:
+        """Get the next move from Claude"""
+        prompt = self.create_prompt(board)
+
+        for _ in range(self.config.max_retries):
+            message = self.client.messages.create(
+                model=self.config.model_name,
+                max_tokens=10,
+                system="You are a chess engine. Respond only with moves in algebraic notation.",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt
+                            }
+                        ]
+                    }
+                ]
+            )
+
+            move_str = message.content[0].text.strip()
+            try:
+                move = board.parse_san(move_str)
+            except Exception as e:
+                print(f"Error parsing move: {e}")
+                continue
+
+            if move in board.legal_moves:
+                return move
+
+class ChessGame:
+    """Manages a chess game between two models"""
+    def __init__(self, white_player: ChessModel, black_player: ChessModel,
+                 evaluator: Optional[ChessModel] = None):
+        self.white_player = white_player
+        self.black_player = black_player
+        self.board = chess.Board()
+        self.evaluator = evaluator
+        self.evaluations = []
+
+    def play_game(self, verbose: bool = True) -> Tuple[str, Dict[str, Any]]:
+        """Play a complete game and return the PGN and performance stats"""
+        move_count = 0
+
+        while not self.board.is_game_over():
+            is_white = self.board.turn == chess.WHITE
+            current_player = self.white_player if is_white else self.black_player
+
+            if verbose:
+                print(f"\n{'White' if is_white else 'Black'} ({current_player.name}) to move")
+                print(self.board)
+
+            move = current_player.get_move(self.board)
+            if not move:
+                print(f"Invalid move from {current_player.name}")
+                return None, None
+            if verbose:
+                print(f"Move: {self.board.san(move)}")
+
+            self.board.push(move)
+            move_count += 1
+
+        pgn = self.create_pgn()
+
+        stats = None # TODO: calculate average centipawn loss
+
+        return pgn, stats
+
+
+    def create_pgn(self) -> str:
+        """Create a PGN string from the game"""
+        game = chess.pgn.Game()
+        game.headers["Event"] = f"{self.white_player.name} vs {self.black_player.name}"
+        game.headers["Date"] = datetime.now().strftime("%Y.%m.%d")
+        game.headers["White"] = self.white_player.name
+        game.headers["Black"] = self.black_player.name
+        game.headers["Result"] = self.board.result()
+
+        node = game
+        for move in self.board.move_stack:
+            node = node.add_variation(move)
+
+        return str(game)
+
+def play_chess_game(config: ChessConfig, lm_config: LMConfig) -> None:
+    """Utility function to quickly set up and play a game"""
+    # Create models
+    lm_model = None
+    if "openai" in lm_config.type:
+        if "o1" in lm_config.model_name:
+            lm_model = O1ChessModel(lm_config)
+        elif "gpt" in lm_config.model_name:
+            lm_model = GPT4ChessModel(lm_config)
+    elif "anthropic" in lm_config.type:
+        lm_model = ClaudeChessModel(lm_config)
+    assert lm_model
+    stockfish = StockfishModel(config.stockfish_path)
+
+    # Set up players based on color
+    if lm_config.is_white:
+        white_player = lm_model
+        black_player = stockfish
     else:
-        return "*"
+        white_player = stockfish
+        black_player = lm_model
 
-def play_chess():
-    board = chess.Board()
+    # Create evaluator for analysis
+    evaluator = StockfishModel(config.stockfish_path)
 
-    print("Starting chess game: GPT vs GPT")
+    # Create and play game
+    game = ChessGame(
+        white_player=white_player,
+        black_player=black_player,
+        evaluator=evaluator
+    )
 
-    try:
-        while not board.is_game_over():
-            # White's turn
-            print("\nWhite is thinking...")
-            move = white_get_move(board)
-            print(f"White plays: {board.san(move)}")
-            board.push(move)
+    pgn, stats = game.play_game(verbose=config.verbose)
+    if not pgn or not stats:
+        return None
 
-            if board.is_game_over():
-                break
-
-            # Black's turn
-            print("\nBlack is thinking...")
-            move = black_get_move(board)
-            print(f"Black plays: {board.san(move)}")
-            board.push(move)
-
-    except Exception as e:
-        print(f"\nGame ended due to error: {e}")
-
-    # Generate result
-    result = get_game_result(board)
-
-    # Create PGN
-    pgn = create_pgn(board, result)
-
-    # Save PGN to file
-    with open("gpt_chess_game.pgn", "w") as f:
+    # Save game
+    with open(config.output_path, "x") as f:
         f.write(pgn)
-
-    print("\nGame Over!")
-    print(board.result())
-    print(f"\nGame saved to 'gpt_chess_game.pgn'")
-    print("\nYou can import this PGN file directly into Lichess at https://lichess.org/paste")
-
-    return board, pgn
-
-def main():
-    openai.api_key = "key"
-    final_board, pgn = play_chess()
-    print("\nPGN Output (copy this to Lichess):")
-    print("\n" + pgn)
-    return final_board
-
-if __name__ == "__main__":
-    main()
+    return stats
