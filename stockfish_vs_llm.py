@@ -296,12 +296,12 @@ class ChessGame:
 
             # Convert mate scores to centipawn values
             def score_to_cp(score):
-                if score.is_mate():
-                    if score.mate() > 0:
-                        return 20000 - (score.mate() * 10)
+                if score.relative.is_mate():
+                    if score.relative.mate() > 0:
+                        return 20000 - (score.relative.mate() * 10)
                     else:
-                        return -20000 - (score.mate() * 10)
-                return score.cp
+                        return -20000 - (score.relative.mate() * 10)
+                return score.relative.score()
 
             prev_cp = score_to_cp(prev_score)
             curr_cp = score_to_cp(curr_score)
@@ -310,7 +310,7 @@ class ChessGame:
             if self.llm_is_white:
                 loss = -(curr_cp - prev_cp)
             else:
-                loss = -(-prev_cp - (-curr_cp))
+                loss = curr_cp - prev_cp
 
             # Only record positive losses (negative means position improved)
             if loss > 0:
@@ -329,6 +329,7 @@ class ChessGame:
             'llm_move_count': len(llm_losses),
             'detailed_losses': llm_losses
         }
+
 
 
     def create_pgn(self):
