@@ -8,69 +8,78 @@ import openai
 import anthropic
 from dataclasses import dataclass
 
-@dataclass
 class ChessConfig:
     """Configuration for chess games"""
-    stockfish_path: str = "/opt/homebrew/bin/stockfish"
-    verbose: bool = True
-    output_path: str = "game.pgn"
+    stockfish_path = "/opt/homebrew/bin/stockfish"
+    verbose = True
+    output_path = "game.pgn"
 
-@dataclass
+    def __init__(self, stockfish_path, verbose, output_path):
+        self.stockfish_path = stockfish_path
+        self.verbose = verbose
+        self.output_path = output_path
+
 class LMConfig:
     """Configuration for LM-based chess models"""
-    model_name: str
-    api_key: str
-    type: str
-    max_retries: int = 3
-    is_white: bool = True
+    model_name = None
+    api_key = None
+    type = None
+    max_retries = 3
+    is_white = True
+
+    def __init__(self, model_name, api_key, type, max_retries=3, is_white=True):
+        self.model_name = model_name
+        self.api_key = api_key
+        self.type = type
+        self.max_retries = max_retries
+        self.is_white = is_white
 
 class ChessModel(ABC):
     """Abstract base class for chess models"""
-    @abstractmethod
-    def get_move(self, board: chess.Board) -> chess.Move:
+    def get_move(self, board):
         """Get the next move from the model given a board state"""
         pass
 
-    @property
-    @abstractmethod
-    def name(self) -> str:
+    def name(self):
         """Get the model name"""
         pass
 
 class StockfishModel(ChessModel):
     """Example implementation of a chess engine model"""
-    def __init__(self, path: str, time_limit: float = 0.01):
+    def __init__(self, path, time_limit = 0.01):
         self.path = path
         self.time_limit = time_limit
         self.engine = chess.engine.SimpleEngine.popen_uci(path)
 
-    def get_move(self, board: chess.Board) -> chess.Move:
+    def get_move(self, board):
         result = self.engine.play(board, chess.engine.Limit(time=self.time_limit))
         return result.move
 
-    @property
-    def name(self) -> str:
+    def name(self):
         return "Stockfish"
 
     def __del__(self):
         if hasattr(self, 'engine'):
             self.engine.quit()
 
+    def evaluate(self, board):
+        result = self.engine.analyse(board, chess.engine.Limit(time=self.time_limit))
+        return result
+
 class GPT4ChessModel(ChessModel):
     """
     GPT-4 implementation of a chess model.
     Uses structured prompting to get valid moves.
     """
-    def __init__(self, config: LMConfig):
+    def __init__(self, config):
         self.config = config
         openai.api_key = config.api_key
         self._role = "White" if config.is_white else "Black"
 
-    @property
-    def name(self) -> str:
+    def name(self):
         return f"{self.config.model_name}"
 
-    def create_prompt(self, board: chess.Board) -> str:
+    def create_prompt(self, board):
         """Create a structured prompt for the current board state"""
         legal_moves = [board.san(move) for move in board.legal_moves]
 
@@ -89,7 +98,7 @@ Important:
 3. Respond ONLY with the chosen move in standard algebraic notation (e.g., "e4" or "Nf3")
 4. No explanations or additional text"""
 
-    def get_move(self, board: chess.Board) -> chess.Move:
+    def get_move(self, board):
         """Get the next move from GPT-4"""
         prompt = self.create_prompt(board)
 
@@ -119,16 +128,15 @@ class O1ChessModel(ChessModel):
     O1 implementation of a chess model.
     Uses structured prompting to get valid moves.
     """
-    def __init__(self, config: LMConfig):
+    def __init__(self, config):
         self.config = config
         openai.api_key = config.api_key
         self._role = "White" if config.is_white else "Black"
 
-    @property
-    def name(self) -> str:
+    def name(self):
         return f"{self.config.model_name}"
 
-    def create_prompt(self, board: chess.Board) -> str:
+    def create_prompt(self, board):
         """Create a structured prompt for the current board state"""
         legal_moves = [board.san(move) for move in board.legal_moves]
 
@@ -147,7 +155,7 @@ Important:
 3. Respond ONLY with the chosen move in standard algebraic notation (e.g., "e4" or "Nf3")
 4. No explanations or additional text"""
 
-    def get_move(self, board: chess.Board) -> chess.Move:
+    def get_move(self, board):
         """Get the next move from GPT-4"""
         prompt = self.create_prompt(board)
 
@@ -175,16 +183,15 @@ class ClaudeChessModel(ChessModel):
     Claude implementation of a chess model.
     Uses structured prompting to get valid moves.
     """
-    def __init__(self, config: LMConfig):
+    def __init__(self, config):
         self.config = config
         self._role = "White" if config.is_white else "Black"
         self.client = anthropic.Anthropic(api_key=config.api_key)
 
-    @property
-    def name(self) -> str:
+    def name(self):
         return f"{self.config.model_name}"
 
-    def create_prompt(self, board: chess.Board) -> str:
+    def create_prompt(self, board):
         """Create a structured prompt for the current board state"""
         legal_moves = [board.san(move) for move in board.legal_moves]
 
@@ -203,7 +210,7 @@ Important:
 3. Respond ONLY with the chosen move in standard algebraic notation (e.g., "e4" or "Nf3")
 4. No explanations or additional text"""
 
-    def get_move(self, board: chess.Board) -> chess.Move:
+    def get_move(self, board):
         """Get the next move from Claude"""
         prompt = self.create_prompt(board)
 
@@ -237,17 +244,17 @@ Important:
 
 class ChessGame:
     """Manages a chess game between two models"""
-    def __init__(self, white_player: ChessModel, black_player: ChessModel,
-                 evaluator: Optional[ChessModel] = None):
+    def __init__(self, white_player, black_player, llm_is_white, evaluator = None):
         self.white_player = white_player
         self.black_player = black_player
         self.board = chess.Board()
         self.evaluator = evaluator
-        self.evaluations = []
+        self.llm_is_white = llm_is_white
 
-    def play_game(self, verbose: bool = True) -> Tuple[str, Dict[str, Any]]:
+    def play_game(self, verbose = True):
         """Play a complete game and return the PGN and performance stats"""
         move_count = 0
+        stats = []
 
         while not self.board.is_game_over():
             is_white = self.board.turn == chess.WHITE
@@ -267,14 +274,64 @@ class ChessGame:
             self.board.push(move)
             move_count += 1
 
+            stats.append(self.evaluator.evaluate(self.board)['score'])
+
         pgn = self.create_pgn()
 
-        stats = None # TODO: calculate average centipawn loss
+        stats = self.process_stats(stats)
 
         return pgn, stats
 
+    def process_stats(self, stats):
+        llm_losses = []
 
-    def create_pgn(self) -> str:
+        for i in range(1, len(stats)):
+            # Skip if it's not LLM's turn
+            is_white_turn = (i % 2 == 0)
+            if is_white_turn != self.llm_is_white:
+                continue
+
+            prev_score = stats[i-1]
+            curr_score = stats[i]
+
+            # Convert mate scores to centipawn values
+            def score_to_cp(score):
+                if score.is_mate():
+                    if score.mate() > 0:
+                        return 20000 - (score.mate() * 10)
+                    else:
+                        return -20000 - (score.mate() * 10)
+                return score.cp
+
+            prev_cp = score_to_cp(prev_score)
+            curr_cp = score_to_cp(curr_score)
+
+            # Calculate loss from LLM's perspective
+            if self.llm_is_white:
+                loss = -(curr_cp - prev_cp)
+            else:
+                loss = -(-prev_cp - (-curr_cp))
+
+            # Only record positive losses (negative means position improved)
+            if loss > 0:
+                llm_losses.append({
+                    'move_number': (i // 2) + 1,
+                    'loss': loss
+                })
+
+        # Calculate average centipawn loss for LLM
+        avg_loss = sum(loss['loss'] for loss in llm_losses) / len(llm_losses) if llm_losses else 0
+        max_loss = max(loss['loss'] for loss in llm_losses) if llm_losses else 0
+
+        return {
+            'llm_avg_centipawn_loss': round(avg_loss, 2),
+            'llm_max_loss': round(max_loss, 2),
+            'llm_move_count': len(llm_losses),
+            'detailed_losses': llm_losses
+        }
+
+
+    def create_pgn(self):
         """Create a PGN string from the game"""
         game = chess.pgn.Game()
         game.headers["Event"] = f"{self.white_player.name} vs {self.black_player.name}"
@@ -289,7 +346,7 @@ class ChessGame:
 
         return str(game)
 
-def play_chess_game(config: ChessConfig, lm_config: LMConfig) -> None:
+def play_chess_game(config, lm_config):
     """Utility function to quickly set up and play a game"""
     # Create models
     lm_model = None
@@ -312,16 +369,18 @@ def play_chess_game(config: ChessConfig, lm_config: LMConfig) -> None:
         black_player = lm_model
 
     # Create evaluator for analysis
-    evaluator = StockfishModel(config.stockfish_path)
+    evaluator = StockfishModel(config.stockfish_path, time_limit=0.5)
 
     # Create and play game
     game = ChessGame(
         white_player=white_player,
         black_player=black_player,
-        evaluator=evaluator
+        evaluator=evaluator,
+        llm_is_white=lm_config.is_white
     )
 
     pgn, stats = game.play_game(verbose=config.verbose)
+
     if not pgn or not stats:
         return None
 
